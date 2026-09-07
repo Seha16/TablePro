@@ -174,6 +174,7 @@ pub fn present(parent: &impl IsA<gtk::Widget>) {
                 editor_font_size: font.value() as u32,
                 history_retention_days: retention.value() as u32,
                 query_timeout_secs: timeout.value() as u32,
+                csv_export: preferences::load().csv_export,
             });
         })
     };

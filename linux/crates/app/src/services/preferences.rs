@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tablepro_core::export::CsvOptions;
 
 use super::config_io::{atomic_write_json, xdg_config_path};
 
@@ -17,6 +18,8 @@ pub struct Preferences {
     /// shutdown.
     #[serde(default = "default_query_timeout_secs")]
     pub query_timeout_secs: u32,
+    #[serde(default)]
+    pub csv_export: CsvOptions,
 }
 
 fn default_history_retention_days() -> u32 {
@@ -35,6 +38,7 @@ impl Default for Preferences {
             editor_font_size: 12,
             history_retention_days: default_history_retention_days(),
             query_timeout_secs: default_query_timeout_secs(),
+            csv_export: CsvOptions::default(),
         }
     }
 }

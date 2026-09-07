@@ -193,10 +193,13 @@ pub enum BrowseTabInput {
         col_index: usize,
         new_value: String,
     },
-    GridSetCellNull {
+    GridSetCellValue {
         row_position: u32,
         col_index: usize,
+        value: Value,
     },
+    GridExportResults(QueryResult),
+    ExportCurrentPage,
     GridDeleteRowAt {
         row_position: u32,
     },
@@ -285,6 +288,9 @@ pub enum BrowseTabOutput {
     CopyRowAsInsert { row_position: u32 },
     /// Generic clipboard-copy request from grid.
     CopyToClipboard(String),
+    /// "Export Results…" from the grid menu or the paginator button.
+    /// Carries the rows to write and a suggested file name stem.
+    ExportResults { result: QueryResult, name: String },
     /// Column-name vocabulary for editor autocomplete; App merges across tabs.
     SchemaWordsChanged(Vec<String>),
     /// Show a generic info dialog for "Cannot edit / select exactly one row".
@@ -313,6 +319,13 @@ pub enum BrowseTabOutput {
 impl BrowseTab {
     pub fn snapshot(&self) -> Option<QueryResult> {
         self.current_result.clone()
+    }
+
+    fn export_name(&self) -> String {
+        match &self.schema {
+            Some(s) => format!("{s}.{}", self.table),
+            None => self.table.clone(),
+        }
     }
 
     pub fn columns(&self) -> &[ColumnInfo] {
@@ -447,7 +460,7 @@ impl BrowseTab {
         prev_button.connect_clicked(move |_| sender_for_prev.input(BrowseTabInput::PrevPage));
         let sender_for_next = sender.clone();
         next_button.connect_clicked(move |_| sender_for_next.input(BrowseTabInput::NextPage));
-        let sender_for_last = sender;
+        let sender_for_last = sender.clone();
         last_button.connect_clicked(move |_| sender_for_last.input(BrowseTabInput::LastPage));
 
         // Paginator lives in a native `gtk::ActionBar` to match the
@@ -458,18 +471,13 @@ impl BrowseTab {
         // background, and high-contrast theming come for free.
         let paginator_bar = gtk::ActionBar::new();
 
-        // Export menu uses win.export-csv / win.export-json (App-level
-        // actions); they read the active tab's snapshot so the buttons
-        // implicitly target this tab when this tab is active.
-        let export_menu = gtk::gio::Menu::new();
-        export_menu.append(Some(&crate::tr!("Export as CSV…")), Some("win.export-csv"));
-        export_menu.append(Some(&crate::tr!("Export as JSON…")), Some("win.export-json"));
-        let export_button = gtk::MenuButton::builder()
+        let export_button = gtk::Button::builder()
             .icon_name("document-save-symbolic")
             .tooltip_text(crate::tr!("Export results"))
-            .menu_model(&export_menu)
             .build();
         export_button.add_css_class("flat");
+        let export_sender = sender.clone();
+        export_button.connect_clicked(move |_| export_sender.input(BrowseTabInput::ExportCurrentPage));
 
         // Filter button — opens the rule editor for server-side WHERE.
         // Action `win.open-filter` is registered in app/mod.rs and
@@ -938,11 +946,6 @@ impl BrowseTab {
         // changed (rare in practice — would require schema migration
         // mid-session). Build the full column-view scaffolding.
         clear_box(&self.grid_holder);
-        let edit_sender = if self.read_only {
-            None
-        } else {
-            Some(self.grid_sender.clone())
-        };
         let pk_col_indices: Vec<usize> = self
             .current_columns
             .iter()
@@ -958,7 +961,8 @@ impl BrowseTab {
             &result,
             &self.current_columns,
             &self.table,
-            edit_sender,
+            self.grid_sender.clone(),
+            !self.read_only,
             self.current_sort,
             Some(self.grid_sender.clone()),
             self.connection_id,
@@ -1461,9 +1465,10 @@ impl SimpleComponent for BrowseTab {
                     return glib::Propagation::Proceed;
                 };
                 grid_sender_for_null
-                    .send(GridMsg::SetCellNull {
+                    .send(GridMsg::SetCellValue {
                         row_position,
                         col_index,
+                        value: Value::Null,
                     })
                     .ok();
                 glib::Propagation::Stop
@@ -1581,13 +1586,16 @@ impl SimpleComponent for BrowseTab {
             },
             GridMsg::CopyToClipboard(text) => BrowseTabInput::GridCopyToClipboard(text),
             GridMsg::CopyRowAsInsert { row_position } => BrowseTabInput::GridCopyRowAsInsert { row_position },
-            GridMsg::SetCellNull {
+            GridMsg::SetCellValue {
                 row_position,
                 col_index,
-            } => BrowseTabInput::GridSetCellNull {
+                value,
+            } => BrowseTabInput::GridSetCellValue {
                 row_position,
                 col_index,
+                value,
             },
+            GridMsg::ExportResults(result) => BrowseTabInput::GridExportResults(result),
             GridMsg::DeleteRowAt { row_position } => BrowseTabInput::GridDeleteRowAt { row_position },
             GridMsg::InsertRow => BrowseTabInput::InsertRow,
             GridMsg::DuplicateRow { row_position } => BrowseTabInput::DuplicateRow { row_position },
@@ -1965,7 +1973,7 @@ impl SimpleComponent for BrowseTab {
                 let Some(selection) = self.current_selection.as_ref() else {
                     return;
                 };
-                let positions = selected_positions(selection);
+                let positions = super::grid::selected_positions(selection);
                 if positions.is_empty() {
                     return;
                 }
@@ -2134,16 +2142,42 @@ impl SimpleComponent for BrowseTab {
                     t.track_cell_edit(key, col_index, original, new);
                 });
             }
-            BrowseTabInput::GridSetCellNull {
+            BrowseTabInput::GridSetCellValue {
                 row_position,
                 col_index,
+                value,
             } => {
+                if let Some(row_obj) = self.row_object_at(row_position)
+                    && let Some(draft_id) = row_obj.draft_id()
+                {
+                    crate::services::change_tracker::with_tab(self.tab_id, |t| {
+                        t.track_draft_cell_edit(draft_id, col_index, value.clone());
+                    });
+                    row_obj.set_cell(col_index, value);
+                    return;
+                }
                 let Some((key, row)) = self.row_key_at(row_position) else {
                     return;
                 };
                 let original = row[col_index].clone();
                 crate::services::change_tracker::with_tab(self.tab_id, |t| {
-                    t.track_cell_edit(key, col_index, original, Value::Null);
+                    t.track_cell_edit(key, col_index, original, value);
+                });
+            }
+            BrowseTabInput::GridExportResults(result) => {
+                let _ = sender.output(BrowseTabOutput::ExportResults {
+                    result,
+                    name: self.export_name(),
+                });
+            }
+            BrowseTabInput::ExportCurrentPage => {
+                let Some(result) = self.current_result.clone() else {
+                    let _ = sender.output(BrowseTabOutput::ShowToast(crate::tr!("Nothing to export")));
+                    return;
+                };
+                let _ = sender.output(BrowseTabOutput::ExportResults {
+                    result,
+                    name: self.export_name(),
                 });
             }
             BrowseTabInput::GridDeleteRowAt { row_position } => {
@@ -2164,7 +2198,7 @@ impl SimpleComponent for BrowseTab {
                 let Some(selection) = self.current_selection.as_ref() else {
                     return;
                 };
-                let positions = selected_positions(selection);
+                let positions = super::grid::selected_positions(selection);
                 if positions.is_empty() {
                     return;
                 }
@@ -2497,16 +2531,6 @@ fn update_selection_chrome(label: &gtk::Label, n: u32) {
     let count = n.to_string();
     label.set_label(&crate::tr!("{n} selected · press Delete to remove").replace("{n}", &count));
     label.set_visible(true);
-}
-
-fn selected_positions(selection: &gtk::MultiSelection) -> Vec<u32> {
-    let bitset = selection.selection();
-    let mut out = Vec::with_capacity(bitset.size() as usize);
-    for i in 0..bitset.size() {
-        out.push(bitset.nth(i as u32));
-    }
-    out.sort_unstable();
-    out
 }
 
 /// Parse a user-typed cell value against the column's declared data

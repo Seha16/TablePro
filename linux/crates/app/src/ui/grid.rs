@@ -4,6 +4,8 @@ use std::rc::Rc;
 use chrono::Datelike;
 use gtk4::prelude::*;
 use gtk4::{self as gtk, gio, glib};
+use relm4::adw;
+use relm4::adw::prelude::*;
 use sourceview5::prelude::*;
 
 use tablepro_core::{ColumnInfo, QueryResult, Value};
@@ -29,10 +31,12 @@ pub enum GridMsg {
     CopyRowAsInsert {
         row_position: u32,
     },
-    SetCellNull {
+    SetCellValue {
         row_position: u32,
         col_index: usize,
+        value: Value,
     },
+    ExportResults(QueryResult),
     DeleteRowAt {
         row_position: u32,
     },
@@ -66,7 +70,8 @@ pub fn build_column_view(
     result: &QueryResult,
     schema_columns: &[ColumnInfo],
     table: &str,
-    edit_sender: Option<relm4::Sender<GridMsg>>,
+    sender: relm4::Sender<GridMsg>,
+    editable: bool,
     sort: Option<(usize, bool)>,
     sort_sender: Option<relm4::Sender<GridMsg>>,
     connection_id: Option<uuid::Uuid>,
@@ -83,14 +88,8 @@ pub fn build_column_view(
         .show_column_separators(true)
         .build();
 
-    // Install the shared cell + empty-space context menus on the
-    // ColumnView. One PopoverMenu per menu shape (editable / readonly
-    // / empty-space) is parented here; cell gestures fill the shared
-    // CellContext slot then popup the appropriate popover. See
-    // `install_grid_context_menus` for the architecture.
-    let grid_menus: Option<GridMenus> = edit_sender
-        .as_ref()
-        .map(|s| install_grid_context_menus(&column_view, s.clone()));
+    let grid_menus =
+        install_grid_context_menus(&column_view, sender.clone(), Rc::new(result.columns.clone()), editable);
 
     // For wide tables (~9+ columns) the default `expand: true` per
     // column shares the viewport fractionally and produces 20-30px
@@ -113,13 +112,13 @@ pub fn build_column_view(
         // hasn't fired yet we fall back to the QueryResult's column
         // metadata, which only knows name + data_type and conservatively
         // reports the rest as false.
-        let editable = is_cell_editable(schema_columns.get(i).unwrap_or(column));
+        let cell_editable = editable && is_cell_editable(schema_columns.get(i).unwrap_or(column));
         let col = build_column(
             column,
             i,
-            editable,
+            cell_editable,
             table.to_string(),
-            edit_sender.clone(),
+            sender.clone(),
             sort_sender.clone(),
             connection_id,
             tab_ctx.clone(),
@@ -197,73 +196,60 @@ fn build_column(
     idx: usize,
     editable: bool,
     table: String,
-    sender: Option<relm4::Sender<GridMsg>>,
+    sender: relm4::Sender<GridMsg>,
     sort_sender: Option<relm4::Sender<GridMsg>>,
     connection_id: Option<uuid::Uuid>,
     tab_ctx: TabGridContext,
     default_min_width: Option<i32>,
     column_view: gtk::ColumnView,
-    grid_menus: Option<GridMenus>,
+    grid_menus: GridMenus,
 ) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    // Editable cells require a sender to dispatch CellEdited / SetCellNull /
-    // CopyRowAsInsert events. When `sender` is None (read-only result grids
-    // in the editor) we always go through the read-only setup path.
-    let edit_sender = if editable { sender.clone() } else { None };
-    let readonly_sender = sender.clone();
     let table_for_persist = table;
 
     let column_data_type = info.data_type.clone();
     let column_name = info.name.clone();
     let column_view_for_setup = column_view.clone();
-    let grid_menus_for_setup = grid_menus.clone();
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
-        if let Some(edit_sender) = edit_sender.clone() {
-            // Type-specific cell widgets per HIG:
-            // - Bool → GtkCheckButton (single-click toggles, native
-            //   Space, no edit-mode dance).
-            // - Date → CellEditor for display + GtkCalendar
-            //   popover for edit (no inline typing; user picks a day).
-            // - Other types → CellEditor + text parsing on
-            //   commit (parse_input_for_column on the receiving side
-            //   coerces to the right native Value variant).
-            if is_bool_type(&column_data_type) {
-                setup_bool_cell(
-                    item,
-                    idx,
-                    column_name.clone(),
-                    edit_sender,
-                    &column_view_for_setup,
-                    grid_menus_for_setup.as_ref(),
-                );
-            } else {
-                let editor_kind = classify_editor_kind(&column_data_type);
-                setup_editable_cell(
-                    item,
-                    idx,
-                    column_name.clone(),
-                    edit_sender,
-                    editor_kind,
-                    &column_view_for_setup,
-                    grid_menus_for_setup.as_ref(),
-                );
-            }
-        } else {
-            setup_readonly_cell(
+        if !editable {
+            setup_readonly_cell(item, idx, column_name.clone(), &column_view_for_setup, &grid_menus);
+            return;
+        }
+        // Type-specific cell widgets per HIG:
+        // - Bool → GtkCheckButton (single-click toggles, native
+        //   Space, no edit-mode dance).
+        // - Date → CellEditor for display + GtkCalendar
+        //   popover for edit (no inline typing; user picks a day).
+        // - Other types → CellEditor + text parsing on
+        //   commit (parse_input_for_column on the receiving side
+        //   coerces to the right native Value variant).
+        if is_bool_type(&column_data_type) {
+            setup_bool_cell(
                 item,
                 idx,
                 column_name.clone(),
-                readonly_sender.clone(),
+                sender.clone(),
                 &column_view_for_setup,
-                grid_menus_for_setup.as_ref(),
+                &grid_menus,
+            );
+        } else {
+            let editor_kind = classify_editor_kind(&column_data_type);
+            setup_editable_cell(
+                item,
+                idx,
+                column_name.clone(),
+                sender.clone(),
+                editor_kind,
+                &column_view_for_setup,
+                &grid_menus,
             );
         }
     });
 
-    let editable_for_bind = editable && sender.is_some();
+    let editable_for_bind = editable;
     // Columns the database auto-fills on INSERT (auto-increment PKs,
     // generated columns) render their NULL placeholder as `(auto)`
     // rather than the generic `<NULL>` / `NULL` sentinels — the user
@@ -541,7 +527,7 @@ fn setup_editable_cell(
     sender: relm4::Sender<GridMsg>,
     editor_kind: CellEditorKind,
     column_view: &gtk::ColumnView,
-    menus: Option<&GridMenus>,
+    menus: &GridMenus,
 ) {
     let label = super::cell_editor::CellEditor::new();
     label.set_hexpand(true);
@@ -554,17 +540,7 @@ fn setup_editable_cell(
     COLUMN_SLOT.set(&label, idx);
     item.set_child(Some(&label));
 
-    if let Some(menus) = menus {
-        attach_cell_gesture(
-            label.upcast_ref(),
-            column_view,
-            idx,
-            column_name,
-            true,
-            true, // CellEditor → text-editable, "Edit cell" applies
-            menus,
-        );
-    }
+    attach_cell_gesture(label.upcast_ref(), column_view, idx, column_name, true, true, menus);
     install_edit_commit_handler(&label, idx, sender.clone());
     install_edit_triggers(&label, idx, sender, editor_kind);
 }
@@ -582,7 +558,7 @@ fn setup_bool_cell(
     column_name: String,
     sender: relm4::Sender<GridMsg>,
     column_view: &gtk::ColumnView,
-    menus: Option<&GridMenus>,
+    menus: &GridMenus,
 ) {
     let checkbox = gtk::CheckButton::builder()
         .halign(gtk::Align::Start)
@@ -593,17 +569,7 @@ fn setup_bool_cell(
     COLUMN_SLOT.set(&checkbox, idx);
     item.set_child(Some(&checkbox));
 
-    if let Some(menus) = menus {
-        attach_cell_gesture(
-            checkbox.upcast_ref(),
-            column_view,
-            idx,
-            column_name,
-            true,
-            false, // CheckButton: editable but not text-editable
-            menus,
-        );
-    }
+    attach_cell_gesture(checkbox.upcast_ref(), column_view, idx, column_name, true, false, menus);
     checkbox.connect_toggled(move |cb| {
         // Suppress the echo while the bind callback is driving the
         // checkbox programmatically.
@@ -825,16 +791,12 @@ fn move_focus(widget: &impl IsA<gtk::Widget>, direction: gtk::DirectionType) {
     window.child_focus(direction);
 }
 
-/// Setup a read-only cell — plain `gtk::Label` with selectable text +
-/// ellipsis on overflow, plus the context menu (Copy value, Copy row
-/// as INSERT) for non-mutating actions.
 fn setup_readonly_cell(
     item: &gtk::ListItem,
     idx: usize,
     column_name: String,
-    _sender: Option<relm4::Sender<GridMsg>>,
     column_view: &gtk::ColumnView,
-    menus: Option<&GridMenus>,
+    menus: &GridMenus,
 ) {
     let label = gtk::Label::builder()
         .xalign(0.0)
@@ -845,9 +807,7 @@ fn setup_readonly_cell(
         .margin_end(8)
         .build();
     item.set_child(Some(&label));
-    if let Some(menus) = menus {
-        attach_cell_gesture(label.upcast_ref(), column_view, idx, column_name, false, false, menus);
-    }
+    attach_cell_gesture(label.upcast_ref(), column_view, idx, column_name, false, false, menus);
 }
 
 /// Capture-phase double-click + key handler bundle. Routes F2 / Enter
@@ -1248,129 +1208,226 @@ struct CellContext {
     column_name: String,
 }
 
-/// Per-grid context-menu surface. Built once in
-/// `install_grid_context_menus` and threaded into each cell's
-/// `attach_cell_gesture` so every cell shares the same popover +
-/// action group rather than constructing its own.
 #[derive(Clone)]
 pub(super) struct GridMenus {
     context: Rc<RefCell<Option<CellContext>>>,
-    /// Popover rendered when the user right-clicks an editable cell
-    /// (CellEditor / CheckButton). Holds the full Edit / Copy /
-    /// Mutate menu. The Edit-cell action's `enabled` state is toggled
-    /// per-press; menu items with `hidden-when="action-disabled"`
-    /// disappear from the popover when their action is disabled, so
-    /// bool cells never see a useless "Edit cell" entry.
     editable_popover: gtk::PopoverMenu,
-    /// Popover rendered for read-only cells (auto-PK, generated
-    /// columns). Just the copy actions.
     readonly_popover: gtk::PopoverMenu,
-    /// `cell.edit` action exposed so cell gestures can toggle its
-    /// enabled state per right-click without a fresh action-group
-    /// lookup. Only enabled when the right-clicked cell is text-
-    /// editable (CellEditor); disabled for CheckButton (bool) cells.
     edit_action: gio::SimpleAction,
 }
 
-/// Install the shared cell + empty-space context menus on the
-/// ColumnView. Called once from `build_column_view` for editable
-/// grids; read-only result grids skip this.
-///
-/// One PopoverMenu per menu shape (editable / readonly / empty),
-/// parented to the ColumnView. Cell gestures fill the shared
-/// `CellContext` slot then popup the appropriate popover; action
-/// handlers read from the slot, dispatch the right `GridMsg`. This
-/// is the GTK4 idiomatic pattern — same as GtkTabBar's tab context
-/// menu, GNOME Files's row context menu, etc. — and replaces the
-/// old "one popover + one action group per cell widget" approach
-/// which carried ~70 popover instances on a typical 7-column grid.
-fn install_grid_context_menus(column_view: &gtk::ColumnView, sender: relm4::Sender<GridMsg>) -> GridMenus {
+struct MenuShape {
+    edit_cell: bool,
+    set_value: bool,
+    row_ops: bool,
+}
+
+fn build_cell_menu(shape: MenuShape) -> gio::Menu {
+    let menu = gio::Menu::new();
+    if shape.edit_cell {
+        let edit_section = gio::Menu::new();
+        let edit_item = gio::MenuItem::new(Some(&crate::tr!("Edit cell")), Some("cell.edit"));
+        edit_item.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+        edit_section.append_item(&edit_item);
+        menu.append_section(None, &edit_section);
+    }
+
+    let copy_as = gio::Menu::new();
+    copy_as.append(Some(&crate::tr!("Rows")), Some("cell.copy-rows"));
+    copy_as.append(Some(&crate::tr!("With Headers")), Some("cell.copy-rows-headers"));
+    copy_as.append(Some(&crate::tr!("JSON")), Some("cell.copy-json"));
+    copy_as.append(Some(&crate::tr!("CSV")), Some("cell.copy-csv"));
+    copy_as.append(Some(&crate::tr!("CSV with Headers")), Some("cell.copy-csv-headers"));
+    copy_as.append(Some(&crate::tr!("Markdown")), Some("cell.copy-markdown"));
+    copy_as.append(Some(&crate::tr!("IN Clause")), Some("cell.copy-in-clause"));
+    if shape.row_ops {
+        let sql_section = gio::Menu::new();
+        sql_section.append(Some(&crate::tr!("INSERT Statement")), Some("cell.copy-row-insert"));
+        copy_as.append_section(None, &sql_section);
+    }
+    let copy_section = gio::Menu::new();
+    copy_section.append(Some(&crate::tr!("Copy")), Some("cell.copy"));
+    copy_section.append_submenu(Some(&crate::tr!("Copy as")), &copy_as);
+    copy_section.append(Some(&crate::tr!("Copy column name")), Some("cell.copy-column-name"));
+    menu.append_section(None, &copy_section);
+
+    let json_section = gio::Menu::new();
+    json_section.append(Some(&crate::tr!("Show Row as JSON")), Some("cell.show-row-json"));
+    menu.append_section(None, &json_section);
+
+    let action_section = gio::Menu::new();
+    if shape.set_value {
+        let set_value = gio::Menu::new();
+        set_value.append(Some(&crate::tr!("Empty")), Some("cell.set-empty"));
+        set_value.append(Some("NULL"), Some("cell.set-null"));
+        action_section.append_submenu(Some(&crate::tr!("Set Value")), &set_value);
+    }
+    action_section.append(Some(&crate::tr!("Export Results\u{2026}")), Some("cell.export"));
+    if shape.row_ops {
+        action_section.append(Some(&crate::tr!("Insert row")), Some("cell.insert-row"));
+        action_section.append(Some(&crate::tr!("Duplicate")), Some("cell.duplicate-row"));
+        action_section.append(Some(&crate::tr!("Delete")), Some("cell.delete-row"));
+    }
+    menu.append_section(None, &action_section);
+    menu
+}
+
+fn install_grid_context_menus(
+    column_view: &gtk::ColumnView,
+    sender: relm4::Sender<GridMsg>,
+    columns: Rc<Vec<ColumnInfo>>,
+    editable: bool,
+) -> GridMenus {
     let context: Rc<RefCell<Option<CellContext>>> = Rc::new(RefCell::new(None));
 
-    // Editable-cell menu model. The Edit-cell item is marked
-    // hidden-when="action-disabled" so when the cell is a CheckButton
-    // (no text edit mode) the item disappears entirely instead of
-    // rendering greyed out.
-    let editable_menu = gio::Menu::new();
-    let edit_section = gio::Menu::new();
-    let edit_item = gio::MenuItem::new(Some(&crate::tr!("Edit cell")), Some("cell.edit"));
-    edit_item.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
-    edit_section.append_item(&edit_item);
-    editable_menu.append_section(None, &edit_section);
-    let copy_section = gio::Menu::new();
-    copy_section.append(Some(&crate::tr!("Copy value")), Some("cell.copy-value"));
-    copy_section.append(Some(&crate::tr!("Copy column name")), Some("cell.copy-column-name"));
-    copy_section.append(Some(&crate::tr!("Copy row as INSERT")), Some("cell.copy-row-insert"));
-    editable_menu.append_section(None, &copy_section);
-    let mutate_section = gio::Menu::new();
-    mutate_section.append(Some(&crate::tr!("Insert row")), Some("cell.insert-row"));
-    mutate_section.append(Some(&crate::tr!("Duplicate row")), Some("cell.duplicate-row"));
-    mutate_section.append(Some(&crate::tr!("Set to NULL")), Some("cell.set-null"));
-    mutate_section.append(Some(&crate::tr!("Delete row")), Some("cell.delete-row"));
-    editable_menu.append_section(None, &mutate_section);
-
-    // Read-only cell menu — copy actions only. Auto-PK / generated
-    // cells aren't user-editable so Edit / Set NULL / mutate items
-    // would all be inert; per HIG don't show inert items.
-    let readonly_menu = gio::Menu::new();
-    let copy_section_ro = gio::Menu::new();
-    copy_section_ro.append(Some(&crate::tr!("Copy value")), Some("cell.copy-value"));
-    copy_section_ro.append(Some(&crate::tr!("Copy column name")), Some("cell.copy-column-name"));
-    copy_section_ro.append(Some(&crate::tr!("Copy row as INSERT")), Some("cell.copy-row-insert"));
-    readonly_menu.append_section(None, &copy_section_ro);
-
-    // Empty-area-below-last-row menu — single Insert row entry.
+    let editable_menu = build_cell_menu(MenuShape {
+        edit_cell: true,
+        set_value: true,
+        row_ops: true,
+    });
+    let row_ops_menu = build_cell_menu(MenuShape {
+        edit_cell: false,
+        set_value: false,
+        row_ops: true,
+    });
+    let readonly_menu = build_cell_menu(MenuShape {
+        edit_cell: false,
+        set_value: false,
+        row_ops: false,
+    });
     let empty_menu = gio::Menu::new();
     empty_menu.append(Some(&crate::tr!("Insert row")), Some("cell.insert-row"));
 
-    // Single action group on the ColumnView. Every popover (editable,
-    // readonly, empty) resolves `cell.*` actions through this one
-    // group via the muxer chain, so menu-item activations always
-    // reach a live handler.
     let group = gio::SimpleActionGroup::new();
-    let edit_action = {
-        let ctx = context.clone();
-        gio::ActionEntry::builder("edit")
-            .activate(move |_, _, _| {
-                if let Some(slot) = ctx.borrow().as_ref()
-                    && let Ok(label) = slot.widget.clone().downcast::<super::cell_editor::CellEditor>()
-                {
-                    enter_edit_mode(&label);
-                }
+    let slot_position = |slot: &CellContext| POSITION_SLOT.get(&slot.widget).unwrap_or(0);
+
+    macro_rules! cell_action {
+        ($name:literal, |$slot:ident| $body:expr) => {{
+            let ctx = context.clone();
+            gio::ActionEntry::builder($name)
+                .activate(move |_, _, _| {
+                    if let Some($slot) = ctx.borrow().as_ref() {
+                        $body;
+                    }
+                })
+                .build()
+        }};
+    }
+    macro_rules! copy_action {
+        ($name:literal, |$slot:ident, $rows:ident| $text:expr) => {{
+            let s = sender.clone();
+            let cv = column_view.clone();
+            cell_action!($name, |$slot| {
+                let $rows = rows_for_copy(&cv, slot_position($slot));
+                s.send(GridMsg::CopyToClipboard($text)).ok();
             })
-            .build()
+        }};
+    }
+    macro_rules! send_action {
+        ($name:literal, |$slot:ident| $msg:expr) => {{
+            let s = sender.clone();
+            cell_action!($name, |$slot| s.send($msg).ok())
+        }};
+    }
+
+    let edit_action = cell_action!("edit", |slot| {
+        if let Ok(label) = slot.widget.clone().downcast::<super::cell_editor::CellEditor>() {
+            enter_edit_mode(&label);
+        }
+    });
+    let copy_action = {
+        let cols = columns.clone();
+        copy_action!("copy", |slot, rows| if rows.len() > 1 {
+            tablepro_core::export::render_tsv(&cols, &rows, false)
+        } else {
+            cell_text(&slot.widget)
+        })
     };
-    let copy_value_action = {
-        let ctx = context.clone();
-        let s = sender.clone();
-        gio::ActionEntry::builder("copy-value")
-            .activate(move |_, _, _| {
-                if let Some(slot) = ctx.borrow().as_ref() {
-                    s.send(GridMsg::CopyToClipboard(cell_text(&slot.widget))).ok();
-                }
-            })
-            .build()
+    let copy_rows_action = {
+        let cols = columns.clone();
+        copy_action!("copy-rows", |_slot, rows| tablepro_core::export::render_tsv(
+            &cols, &rows, false
+        ))
     };
-    let copy_column_name_action = {
-        let ctx = context.clone();
-        let s = sender.clone();
-        gio::ActionEntry::builder("copy-column-name")
-            .activate(move |_, _, _| {
-                if let Some(slot) = ctx.borrow().as_ref() {
-                    s.send(GridMsg::CopyToClipboard(slot.column_name.clone())).ok();
-                }
-            })
-            .build()
+    let copy_rows_headers_action = {
+        let cols = columns.clone();
+        copy_action!("copy-rows-headers", |_slot, rows| tablepro_core::export::render_tsv(
+            &cols, &rows, true
+        ))
     };
-    let copy_row_action = {
-        let ctx = context.clone();
+    let copy_json_action = {
+        let cols = columns.clone();
+        copy_action!("copy-json", |_slot, rows| tablepro_core::export::render_json(
+            &cols, &rows
+        ))
+    };
+    let copy_csv_action = {
+        let cols = columns.clone();
+        copy_action!("copy-csv", |_slot, rows| tablepro_core::export::render_csv(
+            &cols,
+            &rows,
+            &tablepro_core::export::CsvOptions {
+                header_row: false,
+                ..Default::default()
+            }
+        ))
+    };
+    let copy_csv_headers_action = {
+        let cols = columns.clone();
+        copy_action!("copy-csv-headers", |_slot, rows| tablepro_core::export::render_csv(
+            &cols,
+            &rows,
+            &tablepro_core::export::CsvOptions::default()
+        ))
+    };
+    let copy_markdown_action = {
+        let cols = columns.clone();
+        copy_action!("copy-markdown", |_slot, rows| tablepro_core::export::render_markdown(
+            &cols, &rows
+        ))
+    };
+    let copy_in_clause_action = copy_action!("copy-in-clause", |slot, rows| {
+        tablepro_core::export::render_in_clause(&rows, slot.col_index)
+    });
+    let copy_column_name_action = send_action!("copy-column-name", |slot| GridMsg::CopyToClipboard(
+        slot.column_name.clone()
+    ));
+    let copy_row_insert_action = send_action!("copy-row-insert", |slot| GridMsg::CopyRowAsInsert {
+        row_position: slot_position(slot),
+    });
+    let show_row_json_action = {
+        let cols = columns.clone();
+        let cv = column_view.clone();
+        cell_action!("show-row-json", |slot| {
+            if let Some(row) = row_at(&cv, slot_position(slot)) {
+                let json = tablepro_core::export::row_to_json(&cols, &row.cells_clone());
+                let text = serde_json::to_string_pretty(&json).unwrap_or_default();
+                show_row_json_dialog(&cv, text);
+            }
+        })
+    };
+    let set_empty_action = send_action!("set-empty", |slot| GridMsg::SetCellValue {
+        row_position: slot_position(slot),
+        col_index: slot.col_index,
+        value: Value::Text(String::new()),
+    });
+    let set_null_action = send_action!("set-null", |slot| GridMsg::SetCellValue {
+        row_position: slot_position(slot),
+        col_index: slot.col_index,
+        value: Value::Null,
+    });
+    let export_action = {
         let s = sender.clone();
-        gio::ActionEntry::builder("copy-row-insert")
+        let cv = column_view.clone();
+        let cols = columns.clone();
+        gio::ActionEntry::builder("export")
             .activate(move |_, _, _| {
-                if let Some(slot) = ctx.borrow().as_ref() {
-                    let position = POSITION_SLOT.get(&slot.widget).unwrap_or(0);
-                    s.send(GridMsg::CopyRowAsInsert { row_position: position }).ok();
-                }
+                let result = QueryResult {
+                    columns: cols.as_ref().clone(),
+                    rows: all_rows(&cv),
+                    truncated: false,
+                };
+                s.send(GridMsg::ExportResults(result)).ok();
             })
             .build()
     };
@@ -1382,53 +1439,29 @@ fn install_grid_context_menus(column_view: &gtk::ColumnView, sender: relm4::Send
             })
             .build()
     };
-    let set_null_action = {
-        let ctx = context.clone();
-        let s = sender.clone();
-        gio::ActionEntry::builder("set-null")
-            .activate(move |_, _, _| {
-                if let Some(slot) = ctx.borrow().as_ref() {
-                    let position = POSITION_SLOT.get(&slot.widget).unwrap_or(0);
-                    s.send(GridMsg::SetCellNull {
-                        row_position: position,
-                        col_index: slot.col_index,
-                    })
-                    .ok();
-                }
-            })
-            .build()
-    };
-    let delete_row_action = {
-        let ctx = context.clone();
-        let s = sender.clone();
-        gio::ActionEntry::builder("delete-row")
-            .activate(move |_, _, _| {
-                if let Some(slot) = ctx.borrow().as_ref() {
-                    let position = POSITION_SLOT.get(&slot.widget).unwrap_or(0);
-                    s.send(GridMsg::DeleteRowAt { row_position: position }).ok();
-                }
-            })
-            .build()
-    };
-    let duplicate_row_action = {
-        let ctx = context.clone();
-        let s = sender;
-        gio::ActionEntry::builder("duplicate-row")
-            .activate(move |_, _, _| {
-                if let Some(slot) = ctx.borrow().as_ref() {
-                    let position = POSITION_SLOT.get(&slot.widget).unwrap_or(0);
-                    s.send(GridMsg::DuplicateRow { row_position: position }).ok();
-                }
-            })
-            .build()
-    };
+    let delete_row_action = send_action!("delete-row", |slot| GridMsg::DeleteRowAt {
+        row_position: slot_position(slot),
+    });
+    let duplicate_row_action = send_action!("duplicate-row", |slot| GridMsg::DuplicateRow {
+        row_position: slot_position(slot),
+    });
     group.add_action_entries([
         edit_action,
-        copy_value_action,
+        copy_action,
+        copy_rows_action,
+        copy_rows_headers_action,
+        copy_json_action,
+        copy_csv_action,
+        copy_csv_headers_action,
+        copy_markdown_action,
+        copy_in_clause_action,
         copy_column_name_action,
-        copy_row_action,
-        insert_row_action,
+        copy_row_insert_action,
+        show_row_json_action,
+        set_empty_action,
         set_null_action,
+        export_action,
+        insert_row_action,
         delete_row_action,
         duplicate_row_action,
     ]);
@@ -1440,56 +1473,134 @@ fn install_grid_context_menus(column_view: &gtk::ColumnView, sender: relm4::Send
         .downcast::<gio::SimpleAction>()
         .expect("ActionEntry registers SimpleAction");
 
-    // Build the popovers and parent eagerly so each PopoverMenu's
-    // action muxer snapshots the ColumnView's `cell` group at
-    // set_parent() time. (Lazy parenting in the gesture handler
-    // creates the popover in a standalone muxer scope where the
-    // group isn't visible and every menu-item click is silently
-    // dropped — see sidebar_row.rs:146 for the same root-cause.)
-    let editable_popover = gtk::PopoverMenu::from_model(Some(&editable_menu));
-    editable_popover.set_has_arrow(true);
-    editable_popover.set_parent(column_view);
-    let readonly_popover = gtk::PopoverMenu::from_model(Some(&readonly_menu));
-    readonly_popover.set_has_arrow(true);
-    readonly_popover.set_parent(column_view);
-    let empty_popover = gtk::PopoverMenu::from_model(Some(&empty_menu));
-    empty_popover.set_has_arrow(true);
-    empty_popover.set_parent(column_view);
+    // Popovers are parented eagerly so each PopoverMenu's action muxer
+    // snapshots the ColumnView's `cell` group at set_parent() time.
+    // Lazy parenting in the gesture handler drops every activation
+    // silently (see sidebar_row.rs for the same root cause).
+    let make_popover = |model: &gio::Menu| {
+        let popover = gtk::PopoverMenu::from_model_full(model, gtk::PopoverMenuFlags::NESTED);
+        popover.set_has_arrow(true);
+        popover.set_parent(column_view);
+        popover
+    };
+    let editable_popover = make_popover(&editable_menu);
+    let row_ops_popover = make_popover(&row_ops_menu);
+    let readonly_popover = make_popover(&readonly_menu);
+    let empty_popover = make_popover(&empty_menu);
 
-    let editable_for_destroy = editable_popover.clone();
-    let readonly_for_destroy = readonly_popover.clone();
-    let empty_for_destroy = empty_popover.clone();
+    let popovers_for_destroy = [
+        editable_popover.clone(),
+        row_ops_popover.clone(),
+        readonly_popover.clone(),
+        empty_popover.clone(),
+    ];
     column_view.connect_destroy(move |_| {
-        editable_for_destroy.unparent();
-        readonly_for_destroy.unparent();
-        empty_for_destroy.unparent();
+        for popover in &popovers_for_destroy {
+            popover.unparent();
+        }
     });
 
-    // Empty-space gesture on the ColumnView itself. Per-cell gestures
-    // claim their own sequences; only true empty-area clicks reach
-    // here (gated by `pick(x, y) == column_view`).
-    let cv_for_empty = column_view.clone();
-    let empty_for_gesture = empty_popover;
-    let empty_gesture = gtk::GestureClick::builder().button(3).build();
-    empty_gesture.connect_pressed(move |g, _, x, y| {
-        let cv_widget: gtk::Widget = cv_for_empty.clone().upcast();
-        if let Some(picked) = cv_for_empty.pick(x, y, gtk::PickFlags::DEFAULT)
-            && picked != cv_widget
-        {
-            return;
-        }
-        g.set_state(gtk::EventSequenceState::Claimed);
-        empty_for_gesture.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        empty_for_gesture.popup();
-    });
-    column_view.add_controller(empty_gesture);
+    if editable {
+        let cv_for_empty = column_view.clone();
+        let empty_gesture = gtk::GestureClick::builder().button(3).build();
+        empty_gesture.connect_pressed(move |g, _, x, y| {
+            let cv_widget: gtk::Widget = cv_for_empty.clone().upcast();
+            if let Some(picked) = cv_for_empty.pick(x, y, gtk::PickFlags::DEFAULT)
+                && picked != cv_widget
+            {
+                return;
+            }
+            g.set_state(gtk::EventSequenceState::Claimed);
+            empty_popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            empty_popover.popup();
+        });
+        column_view.add_controller(empty_gesture);
+    }
 
     GridMenus {
         context,
         editable_popover,
-        readonly_popover,
+        readonly_popover: if editable { row_ops_popover } else { readonly_popover },
         edit_action: edit_action_obj,
     }
+}
+
+pub(super) fn selected_positions(selection: &gtk::MultiSelection) -> Vec<u32> {
+    let bitset = selection.selection();
+    let mut out = Vec::with_capacity(bitset.size() as usize);
+    for i in 0..bitset.size() {
+        out.push(bitset.nth(i as u32));
+    }
+    out.sort_unstable();
+    out
+}
+
+fn row_at(column_view: &gtk::ColumnView, position: u32) -> Option<RowObject> {
+    column_view.model()?.item(position)?.downcast::<RowObject>().ok()
+}
+
+fn rows_for_copy(column_view: &gtk::ColumnView, clicked: u32) -> Vec<Vec<Value>> {
+    let mut positions = column_view
+        .model()
+        .and_then(|m| m.downcast::<gtk::MultiSelection>().ok())
+        .map(|s| selected_positions(&s))
+        .unwrap_or_default();
+    if positions.is_empty() {
+        positions.push(clicked);
+    }
+    positions
+        .iter()
+        .filter_map(|p| row_at(column_view, *p))
+        .map(|r| r.cells_clone())
+        .collect()
+}
+
+fn all_rows(column_view: &gtk::ColumnView) -> Vec<Vec<Value>> {
+    let Some(model) = column_view.model() else {
+        return Vec::new();
+    };
+    (0..model.n_items())
+        .filter_map(|p| row_at(column_view, p))
+        .map(|r| r.cells_clone())
+        .collect()
+}
+
+fn show_row_json_dialog(parent: &impl IsA<gtk::Widget>, json: String) {
+    let buffer = sourceview5::Buffer::new(None);
+    if let Some(lang) = sourceview5::LanguageManager::default().language("json") {
+        buffer.set_language(Some(&lang));
+    }
+    let scheme_name = if adw::StyleManager::default().is_dark() {
+        "Adwaita-dark"
+    } else {
+        "Adwaita"
+    };
+    buffer.set_style_scheme(sourceview5::StyleSchemeManager::default().scheme(scheme_name).as_ref());
+    buffer.set_text(&json);
+    let view = sourceview5::View::with_buffer(&buffer);
+    view.set_editable(false);
+    view.set_monospace(true);
+    view.set_show_line_numbers(true);
+    view.set_top_margin(8);
+    view.set_left_margin(8);
+    let scrolled = gtk::ScrolledWindow::builder().child(&view).vexpand(true).build();
+
+    let copy_button = gtk::Button::from_icon_name("edit-copy-symbolic");
+    copy_button.set_tooltip_text(Some(&crate::tr!("Copy")));
+    copy_button.connect_clicked(move |b| b.clipboard().set_text(&json));
+    let header = adw::HeaderBar::new();
+    header.pack_end(&copy_button);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&scrolled));
+
+    adw::Dialog::builder()
+        .title(crate::tr!("Row as JSON"))
+        .content_width(560)
+        .content_height(480)
+        .child(&toolbar)
+        .build()
+        .present(Some(parent));
 }
 
 /// Wire the right-click + Menu-key gestures on a single cell widget
