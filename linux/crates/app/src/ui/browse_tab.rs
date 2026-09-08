@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use tablepro_core::{ColumnInfo, QueryResult, Value};
 
-use super::grid::{GridMsg, TabGridContext, build_column_view};
+use super::grid::{CellPreset, GridMsg, TabGridContext, build_column_view};
 
 const PAGE_SIZE_OPTIONS: &[u64] = &[100, 500, 1_000, 5_000, 10_000];
 const DEFAULT_PAGE_SIZE: u64 = 1_000;
@@ -193,11 +193,18 @@ pub enum BrowseTabInput {
         col_index: usize,
         new_value: String,
     },
+    /// Cell context-menu "Set Value". The grid names the preset; the
+    /// tab resolves it against the column's declared type, because
+    /// only the tab holds the column metadata that says whether an
+    /// empty string is a value the column can hold.
     GridSetCellValue {
         row_position: u32,
         col_index: usize,
-        value: Value,
+        preset: CellPreset,
     },
+    /// The grid could not carry out a menu action in full and wants
+    /// to say so.
+    GridShowToast(String),
     GridExportResults(QueryResult),
     ExportCurrentPage,
     GridDeleteRowAt {
@@ -325,6 +332,57 @@ impl BrowseTab {
         match &self.schema {
             Some(s) => format!("{s}.{}", self.table),
             None => self.table.clone(),
+        }
+    }
+
+    /// The tracker context the grid renders through. Copy and export
+    /// read the same context, so what leaves the tab is what the user
+    /// is looking at, pending edits included.
+    fn grid_context(&self) -> TabGridContext {
+        TabGridContext {
+            tab_id: Some(self.tab_id),
+            pk_col_indices: self
+                .current_columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.primary_key)
+                .map(|(i, _)| i)
+                .collect(),
+        }
+    }
+
+    /// What the paginator's Export button writes. Built from the live
+    /// grid so it matches the context menu's Export Results row for
+    /// row; falls back to the fetch itself before the grid exists.
+    fn export_payload(&self) -> Option<QueryResult> {
+        let current = self.current_result.as_ref()?;
+        let Some(column_view) = self.current_column_view.as_ref() else {
+            return Some(current.clone());
+        };
+        Some(super::grid::export_snapshot(
+            column_view,
+            &current.columns,
+            current.truncated,
+            &self.grid_context(),
+        ))
+    }
+
+    /// Resolve a "Set Value" preset against the column it lands in.
+    /// The grid offers Empty only on free-text columns, so the
+    /// fallback here is for the keyboard and action-activation paths:
+    /// an empty string means NULL on a column that takes one, and is
+    /// refused on a column that does not, exactly as typing an empty
+    /// value into the cell would be.
+    fn resolve_cell_preset(&self, preset: CellPreset, col_index: usize) -> Result<Value, String> {
+        match preset {
+            CellPreset::Null => Ok(Value::Null),
+            CellPreset::Empty => {
+                let col = self.current_columns.get(col_index);
+                match col {
+                    Some(c) if super::grid::column_accepts_empty(&c.data_type) => Ok(Value::Text(String::new())),
+                    _ => parse_input_for_column("", col),
+                }
+            }
         }
     }
 
@@ -946,17 +1004,7 @@ impl BrowseTab {
         // changed (rare in practice — would require schema migration
         // mid-session). Build the full column-view scaffolding.
         clear_box(&self.grid_holder);
-        let pk_col_indices: Vec<usize> = self
-            .current_columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.primary_key)
-            .map(|(i, _)| i)
-            .collect();
-        let tab_ctx = TabGridContext {
-            tab_id: Some(self.tab_id),
-            pk_col_indices,
-        };
+        let tab_ctx = self.grid_context();
         let (column_view, selection) = build_column_view(
             &result,
             &self.current_columns,
@@ -1468,7 +1516,7 @@ impl SimpleComponent for BrowseTab {
                     .send(GridMsg::SetCellValue {
                         row_position,
                         col_index,
-                        value: Value::Null,
+                        preset: CellPreset::Null,
                     })
                     .ok();
                 glib::Propagation::Stop
@@ -1585,15 +1633,16 @@ impl SimpleComponent for BrowseTab {
                 new_value,
             },
             GridMsg::CopyToClipboard(text) => BrowseTabInput::GridCopyToClipboard(text),
+            GridMsg::ShowToast(text) => BrowseTabInput::GridShowToast(text),
             GridMsg::CopyRowAsInsert { row_position } => BrowseTabInput::GridCopyRowAsInsert { row_position },
             GridMsg::SetCellValue {
                 row_position,
                 col_index,
-                value,
+                preset,
             } => BrowseTabInput::GridSetCellValue {
                 row_position,
                 col_index,
-                value,
+                preset,
             },
             GridMsg::ExportResults(result) => BrowseTabInput::GridExportResults(result),
             GridMsg::DeleteRowAt { row_position } => BrowseTabInput::GridDeleteRowAt { row_position },
@@ -2145,8 +2194,15 @@ impl SimpleComponent for BrowseTab {
             BrowseTabInput::GridSetCellValue {
                 row_position,
                 col_index,
-                value,
+                preset,
             } => {
+                let value = match self.resolve_cell_preset(preset, col_index) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        let _ = sender.output(BrowseTabOutput::ShowToast(message));
+                        return;
+                    }
+                };
                 if let Some(row_obj) = self.row_object_at(row_position)
                     && let Some(draft_id) = row_obj.draft_id()
                 {
@@ -2164,14 +2220,22 @@ impl SimpleComponent for BrowseTab {
                     t.track_cell_edit(key, col_index, original, value);
                 });
             }
-            BrowseTabInput::GridExportResults(result) => {
+            BrowseTabInput::GridShowToast(message) => {
+                let _ = sender.output(BrowseTabOutput::ShowToast(message));
+            }
+            BrowseTabInput::GridExportResults(mut result) => {
+                // The grid owns the rows it is showing; the fetch that
+                // produced them belongs to the tab, and the hot-path
+                // page refresh swaps rows under a ColumnView built for
+                // an earlier fetch.
+                result.truncated = self.current_result.as_ref().is_some_and(|r| r.truncated);
                 let _ = sender.output(BrowseTabOutput::ExportResults {
                     result,
                     name: self.export_name(),
                 });
             }
             BrowseTabInput::ExportCurrentPage => {
-                let Some(result) = self.current_result.clone() else {
+                let Some(result) = self.export_payload() else {
                     let _ = sender.output(BrowseTabOutput::ShowToast(crate::tr!("Nothing to export")));
                     return;
                 };
@@ -2195,6 +2259,9 @@ impl SimpleComponent for BrowseTab {
                 let _ = sender.output(BrowseTabOutput::CopyToClipboard(text));
             }
             BrowseTabInput::CopySelectedRowsAsTsv => {
+                // Same renderer as the context menu's Copy as > Rows:
+                // one selection cannot produce two different clipboard
+                // payloads depending on how the user asked for it.
                 let Some(selection) = self.current_selection.as_ref() else {
                     return;
                 };
@@ -2202,27 +2269,20 @@ impl SimpleComponent for BrowseTab {
                 if positions.is_empty() {
                     return;
                 }
-                let model = match selection.model() {
-                    Some(m) => m,
-                    None => return,
+                let Some(model) = selection.model() else {
+                    return;
                 };
-                let mut rows: Vec<String> = Vec::with_capacity(positions.len());
-                for pos in &positions {
-                    let Some(item) = model.item(*pos) else { continue };
-                    let Ok(row) = item.downcast::<super::row_object::RowObject>() else {
-                        continue;
-                    };
-                    let cells = row.cells_clone();
-                    let line: Vec<String> = cells
-                        .iter()
-                        .map(|v| escape_tsv_cell(&super::grid::value_to_display_text(v)))
-                        .collect();
-                    rows.push(line.join("\t"));
-                }
+                let ctx = self.grid_context();
+                let rows: Vec<Vec<Value>> = positions
+                    .iter()
+                    .filter_map(|pos| model.item(*pos))
+                    .filter_map(|item| item.downcast::<super::row_object::RowObject>().ok())
+                    .map(|row| ctx.effective_cells(&row))
+                    .collect();
                 if rows.is_empty() {
                     return;
                 }
-                let tsv = rows.join("\n");
+                let tsv = tablepro_core::export::render_tsv(&self.current_columns, &rows, false);
                 let _ = sender.output(BrowseTabOutput::CopyToClipboard(tsv));
             }
             BrowseTabInput::PasteNotSupported => {
@@ -2461,23 +2521,6 @@ fn clear_box(b: &gtk::Box) {
     while let Some(child) = b.first_child() {
         b.remove(&child);
     }
-}
-
-/// TSV cells can't carry literal tab / newline / CR without breaking
-/// the row-or-column boundary. Spreadsheet apps (LibreOffice Calc,
-/// Excel) interpret these as field separators on paste, so a cell
-/// containing one would silently split. Replace with a single space
-/// to preserve the row structure on paste; the user can paste into
-/// a plain text view to see the originals.
-fn escape_tsv_cell(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\t' | '\n' | '\r' => out.push(' '),
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// Collapse newlines / carriage returns to spaces, then squash any

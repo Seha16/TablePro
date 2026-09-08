@@ -91,7 +91,13 @@ pub enum SqlEditorOutput {
     RunStateChanged(bool),
     QueryChanged(String),
     CopyToClipboard(String),
-    ExportResults(QueryResult),
+    ShowToast(String),
+    /// "Export Results…" from a result grid's context menu, with the
+    /// file-name stem derived from the statement that produced it.
+    ExportResults {
+        result: QueryResult,
+        name: String,
+    },
 }
 
 #[relm4::component(pub)]
@@ -398,8 +404,14 @@ impl SimpleComponent for SqlEditor {
             SqlEditorInput::Grid(GridMsg::CopyToClipboard(text)) => {
                 let _ = sender.output(SqlEditorOutput::CopyToClipboard(text));
             }
+            SqlEditorInput::Grid(GridMsg::ShowToast(text)) => {
+                let _ = sender.output(SqlEditorOutput::ShowToast(text));
+            }
             SqlEditorInput::Grid(GridMsg::ExportResults(result)) => {
-                let _ = sender.output(SqlEditorOutput::ExportResults(result));
+                let buffer = self.source_view.buffer();
+                let (start, end) = buffer.bounds();
+                let name = export_name_for_query(&buffer.text(&start, &end, false));
+                let _ = sender.output(SqlEditorOutput::ExportResults { result, name });
             }
             SqlEditorInput::Grid(_) => {}
 
@@ -1111,6 +1123,27 @@ pub fn update_schema_buffer(buffer: &gtk::TextBuffer, schema_words: &[String]) {
     buffer.set_text(&text);
 }
 
+/// File-name stem for an editor export, taken from the statement that
+/// produced the results: exporting two queries in a row proposes two
+/// different files instead of offering to overwrite the first.
+pub fn export_name_for_query(query: &str) -> String {
+    if query.trim().is_empty() {
+        return crate::tr!("query-results");
+    }
+    let mut stem = String::new();
+    for c in derive_tab_label(query).chars() {
+        if c.is_alphanumeric() {
+            stem.extend(c.to_lowercase());
+        } else if !stem.ends_with('-') {
+            stem.push('-');
+        }
+    }
+    match stem.trim_matches('-') {
+        "" => crate::tr!("query-results"),
+        trimmed => trimmed.to_string(),
+    }
+}
+
 pub fn derive_tab_label(query: &str) -> String {
     for line in query.lines() {
         let trimmed = line.trim();
@@ -1171,7 +1204,18 @@ fn apply_editor_font_size(_view: &sourceview5::View, font_size: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_sql_statements, sql_preview, statement_at_cursor, summary_label};
+    use super::{export_name_for_query, split_sql_statements, sql_preview, statement_at_cursor, summary_label};
+
+    #[test]
+    fn export_name_slugs_the_statement() {
+        assert_eq!(export_name_for_query("SELECT * FROM users"), "select-from-users");
+        assert_eq!(export_name_for_query("  select id\nfrom t"), "select-id");
+    }
+
+    #[test]
+    fn export_name_falls_back_when_there_is_no_statement() {
+        assert_eq!(export_name_for_query("   \n  "), crate::tr!("query-results"));
+    }
 
     #[test]
     fn splits_on_top_level_semicolons() {
