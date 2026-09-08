@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use relm4::adw::prelude::*;
@@ -104,8 +103,6 @@ fn combo_row(title: &str, choices: &[&str]) -> adw::ComboRow {
 }
 
 pub fn present(parent: &adw::ApplicationWindow, toast_overlay: &adw::ToastOverlay, result: QueryResult, name: String) {
-    let prefs = Rc::new(RefCell::new(preferences::load()));
-
     let page = adw::PreferencesPage::new();
 
     let format_group = adw::PreferencesGroup::new();
@@ -152,7 +149,7 @@ pub fn present(parent: &adw::ApplicationWindow, toast_overlay: &adw::ToastOverla
             &[&crate::tr!("Period (.)"), &crate::tr!("Comma (,)")],
         ),
     });
-    rows.show(&prefs.borrow().csv_export);
+    rows.show(&preferences::load().csv_export);
     for row in [
         &rows.null_to_empty,
         &rows.line_break_to_space,
@@ -166,14 +163,11 @@ pub fn present(parent: &adw::ApplicationWindow, toast_overlay: &adw::ToastOverla
     }
     page.add(&csv_group);
 
+    // Read-modify-write: the preferences dialog can be open over this
+    // one, and neither should overwrite the other's settings.
     let persist = {
         let rows = rows.clone();
-        let prefs = prefs.clone();
-        Rc::new(move || {
-            let mut prefs = prefs.borrow_mut();
-            prefs.csv_export = rows.read();
-            preferences::save(&prefs);
-        })
+        Rc::new(move || preferences::update(|prefs| prefs.csv_export = rows.read()))
     };
     for row in [
         &rows.null_to_empty,
